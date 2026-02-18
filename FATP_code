@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+import glob
+import time
+import serial
+import pygame
+
+# ---------------- CONFIG ----------------
+BAUD = 115200
+
+# Serial device (leave None to auto-pick /dev/ttyACM0 then /dev/ttyUSB0)
+FORCE_SERIAL_PORT = None
+
+# Controller mapping (common for Switch Pro Controller via USB)
+LEFT_Y_AXIS  = 1   # left stick Y
+RIGHT_Y_AXIS = 3   # right stick Y
+RIGHT_X_AXIS = 2   # NEW: right stick X (for direction detection)
+
+DEADZONE = 0.12
+MAX_PWM = 255
+
+SEND_HZ = 50
+RAMP_PER_SEC = 900          # pwm per second (smooth accel)
+FAILSAFE_TIMEOUT = 0.8      # stop if controller "stale"
+
+# Optional: hold a button to emergency stop (varies by controller)
+STOP_BUTTON = 1
+
+# NEW: Motor 3 (conveyor) config
+ZR_BUTTON = 5               # ZR trigger (run test below to confirm)
+M3_SPEED = 200              # Conveyor speed (0-255)
+M3_DEADZONE_STICK = 0.15    # Stick threshold for "downwards"
+# ----------------------------------------
+
+# ... [keep pick_serial_port(), clamp(), apply_deadzone(), axis_to_pwm(), ramp() unchanged] ...
+
+def main():
+    pygame.init()
+    pygame.joystick.init()
+
+    if pygame.joystick.get_count() == 0:
+        raise RuntimeError("No USB controller detected. Try: ls /dev/input/js*")
+
+    js = pygame.joystick.Joystick(0)
+    js.init()
+    print(f"Controller: {js.get_name()} | axes={js.get_numaxes()} buttons={js.get_numbuttons()}")
+
+    # NEW: Print button mapping to confirm ZR index (run once)
+    print("Testing buttons 0-10 (press ZR):")
+    for i in range(min(11, js.get_numbuttons())):
+        pygame.event.pump()
+        if js.get_button(i):
+            print(f"Button {i}: PRESSED")
+            time.sleep(0.2)
+
+    if js.get_numaxes() <= max(LEFT_Y_AXIS, RIGHT_Y_AXIS, RIGHT_X_AXIS):
+        raise RuntimeError(f"Controller has only {js.get_numaxes()} axes, need up to {max(LEFT_Y_AXIS, RIGHT_Y_AXIS, RIGHT_X_AXIS)}.")
+
+    port = pick_serial_port()
+    ser = serial.Serial(port, BAUD, timeout=0.05)
+    time.sleep(2.0)  # Arduino reset on serial open
+    ser.reset_input_buffer()
+    print(f"Serial: {port} @ {BAUD}")
+    print("Tank drive: Left Y=M1, Right Y=M2. M3: Both sticks down+ZR=forward, up+ZR=reverse. Ctrl+C to stop.")
+
+    period = 1.0 / SEND_HZ
+    last_send = 0.0
+    last_input_time = time.time()
+
+    cur1 = cur2 = cur3 = 0.0  # NEW: cur3 for M3 ramping
+    last_sent1 = last_sent2 = last_sent3 = None  # NEW: track M3
+
+    t_prev = time.time()
+
+    try:
+        while True:
+            now = time.time()
+            dt = now - t_prev
+            t_prev = now
+
+            pygame.event.pump()
+
+            # Read sticks (unchanged + right X)
+            ly = js.get_axis(LEFT_Y_AXIS)
+            ry = js.get_axis(RIGHT_Y_AXIS)
+            rx = js.get_axis(RIGHT_X_AXIS)  # NEW
+
+            tgt1 = axis_to_pwm(ly)
+            tgt2 = axis_to_pwm(ry)
+
+            # NEW: Motor 3 logic - both sticks "downwards" + ZR = forward
+            tgt3 = 0
+            zr_pressed = js.get_button(ZR_BUTTON)
+            ly_down = ly > M3_DEADZONE_STICK      # Downwards (positive Y typical)
+            ry_down = ry > M3_DEADZONE_STICK      # Right stick Y also down
+
+            if zr_pressed:
+                if ly_down and ry_down:
+                    tgt3 = +M3_SPEED     # Both down → forward
+                elif ly < -M3_DEADZONE_STICK and ry < -M3_DEADZONE_STICK:
+                    tgt3 = -M3_SPEED     # Both up → reverse
+
+            # ... [keep "Update fresh input", STOP_BUTTON, failsafe unchanged] ...
+
+            # Ramp for smooth accel/decel (add M3)
+            cur1 = ramp(cur1, float(tgt1), dt, RAMP_PER_SEC)
+            cur2 = ramp(cur2, float(tgt2), dt, RAMP_PER_SEC)
+            cur3 = ramp(cur3, float(tgt3), dt, RAMP_PER_SEC)  # NEW
+
+            # Send at rate, only if changed
+            if (now - last_send) >= period:
+                m1 = int(round(cur1))
+                m2 = int(round(cur2))
+                m3 = int(round(cur3))  # NEW
+
+                if m1 != last_sent1:
+                    ser.write(f"M1 {m1}\n".encode("utf-8"))
+                    last_sent1 = m1
+
+                if m2 != last_sent2:
+                    ser.write(f"M2 {m2}\n".encode("utf-8"))
+                    last_sent2 = m2
+
+                if m3 != last_sent3:  # NEW: Send M3 only if changed
+                    ser.write(f"M3 {m3}\n".encode("utf-8"))
+                    last_sent3 = m3
+
+                last_send = now
+
+            # ... [keep ser.in_waiting unchanged] ...
+
+            time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            ser.write(b"M1 0\nM2 0\nM3 0\n")  # NEW: Stop M3 too
+            time.sleep(0.05)
+        except Exception:
+            pass
+        ser.close()
+        pygame.quit()
+        print("Stopped (M1=0, M2=0, M3=0).")
+
+if __name__ == "__main__":
+    main()
